@@ -9,6 +9,7 @@
     .actions{display:flex;justify-content:flex-end;gap:5px}.toggle,.back{padding:8px 13px;font:600 13px system-ui}section{clear:both;position:relative;top:6px;padding:14px;width:min(330px,86vw);font:14px/1.55 system-ui}
     header{display:flex;justify-content:space-between;align-items:center}header button{background:none;border:0;text-decoration:underline;font-size:12px}ol{max-height:57vh;overflow:auto;padding-left:29px;margin-bottom:0}
     li{padding:4px 0;color:#628e85}li button{color:CanvasText;text-align:left;display:block;width:100%;border:0;background:none;padding:4px;overflow-wrap:anywhere}li button:hover{background:#8882;border-radius:5px}small{display:block;opacity:.65}
+    .question{display:flex;align-items:baseline}.question .expand{flex:none;width:auto;color:#628e85;padding:3px 6px}.sections{margin:3px 0 6px;padding-left:8px;border-left:1px solid #8885}.sections button{font-size:13px;line-height:1.45}.sections .sub{padding-left:18px}
     </style><div class="actions"><button class="back" hidden>返回阅读位置</button><button class="toggle" aria-expanded="false">提问目录</button></div><section hidden><header><strong>当前提问</strong><button>更新目录</button></header><ol></ol><small role="status"></small></section>`;
   const panel = ui.querySelector('section'), toggle = ui.querySelector('.toggle');
   const list = ui.querySelector('ol'), status = ui.querySelector('small');
@@ -23,10 +24,10 @@
     const anchor = [...box.querySelectorAll('[data-turn-key]')].find(el => el.getBoundingClientRect().bottom > edge);
     return {box, top:box.scrollTop, key:anchor?.dataset.turnKey, y:anchor?.getBoundingClientRect().top};
   }
-  function questions() {
+  function questions(from) {
     const selector = ':is([data-message-author-role="user"], [data-turn="user"], [class~="group/user-message"])';
     return [...document.querySelectorAll("main "+selector)]
-      .filter(el => !outgoing.has(el) && !el.closest('[data-app-shell-active-page="false"]') && !el.querySelector(selector))
+      .filter(el => (!from || el === from || (from.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING)) && !outgoing.has(el) && !el.closest('[data-app-shell-active-page="false"]') && !el.querySelector(selector))
       .map(el => {
         const copy = el.cloneNode(true);
         copy.querySelectorAll('.chatgpt-timestamp,button,svg,.sr-only').forEach(n => n.remove());
@@ -69,6 +70,52 @@
   const current = route => state === route && location.pathname === route.path;
   const offset = (el,box) => el.getBoundingClientRect().top - box.getBoundingClientRect().top + box.scrollTop;
 
+  const assistantSelector = ':is([data-message-author-role="assistant"],[data-turn="assistant"])';
+  function replies(prompts = questions(), from) {
+    const byElement = new Map(prompts.map(q => [q.el,q]));
+    const found = [];
+    let owner, ordinal = 0;
+    for (const el of document.querySelectorAll(promptSelector+', main '+assistantSelector)) {
+      if (el.closest('[data-app-shell-active-page="false"]') ||
+          (from && el !== from && !(from.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING))) continue;
+      if (outgoing.has(el)) { owner = undefined; continue; }
+      if (!el.matches(assistantSelector)) { owner = byElement.get(el); ordinal = 0; continue; }
+      if (el.querySelector(assistantSelector)) continue;
+      const id = el.closest('[data-message-id]')?.dataset.messageId ||
+        el.closest('[data-chatgpt-search-message-ids]')?.getAttribute('data-chatgpt-search-message-ids');
+      const nodes = [...el.querySelectorAll('h1,h2')].filter(h =>
+        !h.closest('pre,code,nav,aside,button,[aria-hidden="true"]') && h.textContent.trim());
+      found.push({el,id,owner,nodes,ordinal:ordinal++});
+    }
+    return found;
+  }
+
+  function headingElement(q, answer, index) {
+    const mounted = replies();
+    const reply = mounted.find(r => r.id && r.id === answer.id) ||
+      mounted.find(r => !r.id && r.owner && matches(r.owner,q) && r.ordinal === q.answers.indexOf(answer));
+    if (!reply) return;
+    const heading = answer.headings[index];
+    const same = h => h.level === heading.level && h.text === heading.text;
+    const occurrence = answer.headings.slice(0,index).filter(same).length;
+    const exact = reply.nodes.filter(h => Number(h.tagName[1]) === heading.level && h.textContent.trim() === heading.text);
+    // Cached Markdown may contain inline formatting absent from the rendered label.
+    if (exact[occurrence]) return exact[occurrence];
+    const node = reply.nodes[index];
+    const plain = heading.text.replace(/\[([^\]]+)\]\([^)]+\)/g,'$1').replace(/[*_`~]/g,'');
+    return node && Number(node.tagName[1]) === heading.level && node.textContent.trim() === plain ? node : null;
+  }
+
+  function alignedTop(box, el) {
+    let edge = box === document.scrollingElement ? 0 : Math.max(0,box.getBoundingClientRect().top + box.clientTop);
+    const x = Math.min(innerWidth-1,Math.max(0,el.getBoundingClientRect().left + 2));
+    for (const header of document.querySelectorAll('header,#page-header,[role="banner"],.sticky.top-0')) {
+      const bounds = header.getBoundingClientRect();
+      if (bounds.left <= x && x <= bounds.right && bounds.top <= edge+2 && bounds.bottom > edge &&
+          ['sticky','fixed'].includes(getComputedStyle(header).position)) edge = bounds.bottom;
+    }
+    return Math.max(0,Math.min(box.scrollHeight-box.clientHeight,box.scrollTop+el.getBoundingClientRect().top-edge-8));
+  }
   // Insert newly mounted turns next to a known neighbour. Virtual windows can
   // overlap at either end or include two distinct questions with the same text.
   function merge(rows, incoming) {
@@ -79,6 +126,14 @@
       if (index >= 0) {
         cursor = index;
         if (rows[index].text !== q.text) { rows[index].text = q.text; changed = true; }
+        for (const answer of q.answers || []) {
+          const answers = rows[index].answers ||= [];
+          const old = answers.findIndex(a => a.id === answer.id);
+          if (old >= 0 && JSON.stringify(answers[old].headings) === JSON.stringify(answer.headings)) continue;
+          if (old < 0) answers.push(answer);
+          else answers[old] = answer;
+          changed = true;
+        }
         if (Number.isFinite(q.top)) rows[index].top = q.top;
       } else {
         if (cursor >= 0) cursor++;
@@ -100,42 +155,89 @@
       const li = document.createElement('li'), btn = document.createElement('button');
       btn.textContent = q.text.length > 100 ? q.text.slice(0,99)+'…' : q.text;
       btn.onclick = () => jump(route,q);
-      li.append(btn); buttons.append(li);
+      const line = document.createElement('div');
+      line.className = 'question';
+      line.append(btn);
+      li.append(line);
+      if (q.answers?.some(a => a.headings.length)) {
+        const toggle = document.createElement('button'), sections = document.createElement('div');
+        const key = q.id || q.text;
+        toggle.className = 'expand';
+        toggle.title = '回答标题';
+        toggle.setAttribute('aria-label','展开或收起回答标题');
+        sections.className = 'sections';
+        const show = open => {
+          toggle.textContent = open ? '▾' : '▸';
+          toggle.setAttribute('aria-expanded',String(open));
+          sections.hidden = !open;
+          sections.replaceChildren();
+          if (!open) return;
+          for (const answer of q.answers) answer.headings.forEach((h,index) => {
+            const link = document.createElement('button');
+            link.textContent = h.text;
+            if (h.level === 2) link.className = 'sub';
+            link.onclick = () => jump(route,q,{answer,index});
+            sections.append(link);
+          });
+        };
+        toggle.onclick = () => {
+          if (sections.hidden) route.expanded.add(key); else route.expanded.delete(key);
+          show(route.expanded.has(key));
+        };
+        show(route.expanded.has(key));
+        line.append(toggle);
+        li.append(sections);
+      }
+      buttons.append(li);
     }
     list.replaceChildren(buttons);
     status.textContent = route.rows.length ? (route.complete ? '' : '已显示 ') + route.rows.length + ' 个提问' : '等待页面显示提问';
     update.disabled = route.scanning;
   }
 
-  async function jump(route,q) {
+  async function jump(route,q,section) {
     const serial = ++jumpSerial;
     const current = () => route === state && serial === jumpSerial && route.path === location.pathname;
-    let mounted = questions();
-    if (!mounted.length) {
+    const firstMounted = () => questions()[0]?.el || (section && replies()[0]?.el);
+    let mounted = firstMounted();
+    if (!mounted) {
       status.textContent = '正在等待聊天正文…';
       const deadline = performance.now()+30000;
-      while (current() && !mounted.length && performance.now()<deadline) {
+      while (current() && !mounted && performance.now()<deadline) {
         await settle();
-        mounted = questions();
+        mounted = firstMounted();
       }
       if (!current()) return;
-      if (!mounted.length) { status.textContent = '正文尚未显示，暂时无法跳转。'; return; }
+      if (!mounted) { status.textContent = '正文尚未显示，暂时无法跳转。'; return; }
       draw(route);
     }
     if (route.scanning) route.stopScan = true;
-    const box = scrollBox(mounted[0].el);
+    const box = scrollBox(mounted);
     const move = top => box.scrollTo({top,behavior:'instant'});
     const origin = readingPosition(box);
-    const find = () => questions().find(item =>
-      (item.id && q.id) ? item.id===q.id : item.text===q.text);
+    const find = () => section ? headingElement(q,section.answer,section.index) : questions().find(item => matches(item,q))?.el;
     let target=find();
-    if (!target && Number.isFinite(q.top)) { move(q.top-box.clientHeight/3); await settle(); }
     let stable=0, searching=false, resets=0;
+    if (!target && Number.isFinite(q.top)) {
+      move(q.top-box.clientHeight/3);
+      searching = Boolean(section);
+      await settle();
+    }
     const deadline=performance.now()+30000;
     while (current() && performance.now()<deadline) {
       target=find();
       if (target) {
-        const bounds=target.el.getBoundingClientRect();
+        const bounds=target.getBoundingClientRect();
+        if (section) {
+          const top = alignedTop(box,target);
+          if (Math.abs(top-box.scrollTop) > 1) { move(top); stable = 0; }
+          else if (++stable >= 3) {
+            if (Math.abs(box.scrollTop-origin.top)>1) setReturn(origin);
+            return;
+          }
+          await settle();
+          continue;
+        }
         if (bounds.bottom>0 && bounds.top<innerHeight &&
             Math.abs(bounds.top+bounds.height/2-innerHeight/2)<innerHeight*.42) {
           if (++stable>=7) {
@@ -144,7 +246,7 @@
           }
         } else {
           stable=0;
-          target.el.scrollIntoView({block:'center',behavior:'instant'});
+          target.scrollIntoView({block:'center',behavior:'instant'});
         }
       } else {
         stable=0;
@@ -156,14 +258,14 @@
       }
       await settle();
     }
-    if (current()) status.textContent='未定位到这条提问，请更新目录后重试。';
+    if (current()) status.textContent=section ? '未定位到这个回答标题，请更新目录后重试。' : '未定位到这条提问，请更新目录后重试。';
   }
   function unpack(value) {
     if (Array.isArray(value)) return {rows:value, complete:true};
     return value?.rows ? value : {rows:[],complete:false};
   }
-  async function save(route, replace=false) {
-    const rows = route.rows.map(q => ({...q})), complete = route.complete;
+  async function save(route, replace=false, partial=false) {
+    const rows = structuredClone(route.rows), complete = route.complete;
     try {
       await navigator.locks.request(route.key, async () => {
         if (!current(route)) return;
@@ -171,8 +273,13 @@
         if (!current(route)) return;
         if (replace) restoreOffsets(rows,saved.rows);
         if (replace && saved.complete === complete && saved.rows.length === rows.length &&
-            rows.every((r,i) => r.id === saved.rows[i].id && r.text === saved.rows[i].text)) return;
-        if (!replace && !merge(saved.rows,rows)) return;
+            rows.every((r,i) => r.id === saved.rows[i].id && r.text === saved.rows[i].text &&
+              JSON.stringify(r.answers || []) === JSON.stringify(saved.rows[i].answers || []))) return;
+        if (!replace) {
+          const changed = merge(saved.rows,rows);
+          if (!changed && !(partial && saved.complete)) return;
+          if (partial) saved.complete = false;
+        }
         await chrome.storage.local.set({[route.key]:replace ? {rows,complete} : saved});
       });
     } catch {
@@ -185,11 +292,26 @@
       if (positions.has(q.id) && !Number.isFinite(q.top)) q.top = positions.get(q.id);
     }
   }
-  function mountedRows() {
-    const items = questions();
-    if (!items.length) return [];
-    const box = scrollBox(items[0].el);
-    return items.map(({id,text,el}) => ({...(id ? {id} : {}),text,top:offset(el,box)}));
+  function mountedRows(known = state?.rows || [], from) {
+    const items = questions(from);
+    const box = items.length && scrollBox(items[0].el);
+    const rows = new Map(items.map(q => [q,{...(q.id ? {id:q.id} : {}),text:q.text,top:offset(q.el,box)}]));
+    for (const reply of replies(items, from)) {
+      let row = rows.get(reply.owner);
+      if (!row && !reply.owner && reply.id && reply.nodes.length) {
+        const previous = known.find(q => q.answers?.some(a => a.id === reply.id));
+        if (previous) {
+          if (!rows.has(previous)) rows.set(previous,{id:previous.id,text:previous.text});
+          row = rows.get(previous);
+        }
+      }
+      if (!row || !reply.nodes.length) continue;
+      const answers = row.answers ||= [];
+      const previous = !reply.id && known.find(q => matches(q,row))?.answers?.[reply.ordinal];
+      answers.push({id:reply.id || previous?.id || 'mounted-'+reply.ordinal,
+        headings:reply.nodes.map(h => ({level:Number(h.tagName[1]),text:h.textContent.trim()}))});
+    }
+    return [...rows.values()];
   }
   function refreshMounted(route) {
     if (!route?.key || !current(route) || document.hidden || route.scanning) return;
@@ -201,7 +323,7 @@
   function enter() {
     if (state?.path === location.pathname) return;
     const id = chatId();
-    const route = state = {path:location.pathname,key:id && 'outline-v1:'+id,rows:[],complete:false};
+    const route = state = {path:location.pathname,key:id && 'outline-v1:'+id,rows:[],complete:false,expanded:new Set()};
     ++jumpSerial;
     setReturn(null);
     host.hidden = !id;
@@ -222,47 +344,87 @@
       if (added) save(route);
     }).catch(() => { if (current(route)) route.restored = true; });
   }
-  // Explicit fallback for sites or conversation formats that expose only a
-  // virtual window. Merely entering or expanding a chat never scrolls it.
+  // Start at the saved tail. Most visits can reconcile the mounted suffix in
+  // place. Page forward only when the virtualized new suffix spans more windows.
   update.onclick = async () => {
-    const route = state, first = questions()[0];
-    if (!first || route.scanning) return;
-    const box = scrollBox(first.el), origin = box.scrollTop, rows = [];
+    const route = state;
+    if (route.scanning || document.hidden) return;
+    const tail = route.rows.at(-1);
+    const prompts = [...document.querySelectorAll(promptSelector)].filter(el =>
+      !outgoing.has(el) && !el.closest('[data-app-shell-active-page="false"]'));
+    const anchor = tail?.id && prompts.findLast(el => {
+      const msg = el.closest('[data-message-id]');
+      return msg?.dataset.messageId === tail.id || el.closest('[data-turn-key]')?.dataset.turnKey === tail.id;
+    });
+    const first = anchor || prompts[0] || replies()[0]?.el;
+    if (!first) { status.textContent = '正在等待聊天正文'; return; }
+    const box = scrollBox(first), origin = readingPosition(box);
+    const active = () => current(route) && !route.stopScan && !document.hidden;
     const interrupt = () => { route.stopScan = true; };
-    route.scanning = update.disabled = true;
+    const move = top => box.scrollTo({top,behavior:'instant'});
+    let changed = false, moved = false, partial = false;
+    const read = from => {
+      const rows = mountedRows(route.rows,from);
+      changed = merge(route.rows,rows) || changed;
+      return rows;
+    };
     route.stopScan = false;
-    status.textContent = '正在从页面补全目录…';
+    route.scanning = update.disabled = true;
+    status.textContent = '正在检查最新提问和回答…';
     box.addEventListener('wheel',interrupt,{passive:true});
     box.addEventListener('touchstart',interrupt,{passive:true});
-    const active = () => current(route) && !document.hidden && !route.stopScan;
-    const deadline = performance.now()+120000;
     try {
-      let stable = 0, height = -1;
-      while (active() && stable < 4 && performance.now() < deadline) {
-        box.scrollTo({top:0,behavior:'instant'});
+      const visibleSuffix = anchor ? read(anchor) : [];
+      const end = () => box.scrollHeight-box.clientHeight;
+      const last = anchor && document.querySelectorAll(promptSelector+', main '+assistantSelector);
+      const lastTurn = last?.length && last[last.length-1].closest('[data-turn-key],[data-turn],article');
+      const boxTop = box === document.scrollingElement ? 0 : box.getBoundingClientRect().top;
+      const endMounted = lastTurn && lastTurn.getBoundingClientRect().bottom-boxTop+box.scrollTop >= box.scrollHeight-2;
+      if (!endMounted && box.scrollTop < end()-2) {
+        move(end());
+        moved = true;
         await settle();
-        stable = box.scrollTop < 2 && box.scrollHeight === height ? stable+1 : 0;
-        height = box.scrollHeight;
       }
-      while (active() && performance.now() < deadline) {
-        merge(rows,mountedRows());
-        if (box.scrollTop+box.clientHeight >= box.scrollHeight-2) {
-          if (rows.length) {
-            route.rows = rows; route.authoritative = route.complete = true;
-            save(route,true);
-          }
-          break;
+      if (!active()) return;
+      const bottomRows = endMounted ? visibleSuffix : mountedRows(route.rows,anchor?.isConnected ? anchor : undefined);
+      const joined = !tail || bottomRows.some(q => matches(q,tail) || visibleSuffix.some(v => matches(q,v)));
+      if (!joined && Number.isFinite(tail.top) && tail.top > 0 && tail.top < end() && bottomRows.length) {
+        move(tail.top);
+        moved = true;
+        const deadline = performance.now()+10000;
+        let connected = false;
+        while (active() && performance.now()<deadline) {
+          await settle();
+          if (!active()) return;
+          const windowRows = read();
+          if (windowRows.some(q => bottomRows.some(last => matches(q,last)))) { connected = true; break; }
+          const next = Math.min(end(),box.scrollTop+Math.max(1,box.clientHeight*.85));
+          if (next <= box.scrollTop+1) break;
+          move(next);
         }
-        box.scrollTo({top:box.scrollTop+Math.max(1,Math.floor(box.clientHeight*.85)),behavior:'instant'});
-        await settle();
-      }
+        partial = !connected;
+      } else if (!joined) partial = true;
+      changed = merge(route.rows,bottomRows) || changed;
     } finally {
       box.removeEventListener('wheel',interrupt);
       box.removeEventListener('touchstart',interrupt);
-      route.scanning = false;
       if (current(route)) {
-        if (!route.stopScan) box.scrollTo({top:origin,behavior:'instant'});
-        draw(route);
+        if (moved && !route.stopScan) {
+          move(origin.top);
+          await settle();
+          if (active() && origin.key) {
+            const el = box.querySelector(`[data-turn-key="${CSS.escape(origin.key)}"]`);
+            if (el) move(box.scrollTop+el.getBoundingClientRect().top-origin.y);
+          }
+        }
+        if (current(route)) {
+          if (partial) route.complete = false;
+          route.scanning = false;
+          draw(route);
+          if (active()) status.textContent = partial ? '已检查末尾，其余条目会随阅读补入' :
+            (changed ? '已更新' : '已检查末尾')+' · '+route.rows.length+' 个提问';
+          if (changed || partial) save(route,false,partial);
+        }
       }
     }
   };
@@ -271,7 +433,7 @@
     toggle.setAttribute('aria-expanded',String(!collapsed));
   };
   window.navigation?.addEventListener('navigate', e => {
-    if (new URL(e.destination.url).pathname !== location.pathname) outgoing = new WeakSet(document.querySelectorAll(promptSelector));
+    if (new URL(e.destination.url).pathname !== location.pathname) outgoing = new WeakSet(document.querySelectorAll(promptSelector+', main '+assistantSelector));
   });
   window.navigation?.addEventListener('currententrychange',enter);
   document.addEventListener('reading-panel:questions', e => {
@@ -282,7 +444,11 @@
     enter();
     if (!id || id !== chatId() || !Array.isArray(rows) || !rows.length ||
         !rows.every(q => typeof q?.id === 'string' && typeof q.text === 'string')) return;
-    const next = rows.map(({id,text}) => ({id,text}));
+    const next = rows.map(({id,text,answers}) => ({
+      id,text,answers:Array.isArray(answers) ? answers.filter(a => typeof a?.id === 'string' &&
+        Array.isArray(a.headings) && a.headings.every(h => [1,2].includes(h?.level) && typeof h.text === 'string')) : []
+    }));
+    merge(next,mountedRows(next).filter(q => next.some(r => matches(r,q))));
     restoreOffsets(next,state.rows);
     state.rows = next;
     state.authoritative = state.complete = true;
@@ -293,7 +459,7 @@
     if (frame || document.hidden) return;
     frame = requestAnimationFrame(() => { frame = 0; enter(); refreshMounted(state); });
   }
-  const selector = promptSelector.slice(5);
+  const selector = promptSelector.slice(5)+',h1,h2';
   const observer = new MutationObserver(records => {
     if (location.pathname !== state.path || records.some(r =>
       r.target.parentElement?.closest(selector) || r.target.closest?.(selector) ||

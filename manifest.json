@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "对话阅读面板",
   "description": "打开聊天即显示提问目录，支持跳转、返回和本地缓存。",
-  "version": "1.3.1",
+  "version": "1.4.0",
   "content_scripts": [
     {
       "matches": [
