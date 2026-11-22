@@ -70,7 +70,10 @@
   const current = route => state === route && location.pathname === route.path;
   const offset = (el,box) => el.getBoundingClientRect().top - box.getBoundingClientRect().top + box.scrollTop;
 
-  const assistantSelector = ':is([data-message-author-role="assistant"],[data-turn="assistant"])';
+  const semanticAssistant = ':is([data-message-author-role="assistant"],[data-turn="assistant"])';
+  const renderedAssistant = '[class*="DilResponseRoot-"]';
+  const markdownReply = '[data-turn-key] [class*="MarkdownRoot-"]';
+  const assistantSelector = `:is(${semanticAssistant},${renderedAssistant},${markdownReply})`;
   function replies(prompts = questions(), from) {
     const byElement = new Map(prompts.map(q => [q.el,q]));
     const found = [];
@@ -80,12 +83,19 @@
           (from && el !== from && !(from.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING))) continue;
       if (outgoing.has(el)) { owner = undefined; continue; }
       if (!el.matches(assistantSelector)) { owner = byElement.get(el); ordinal = 0; continue; }
-      if (el.querySelector(assistantSelector)) continue;
+      if (el.querySelector(semanticAssistant)) continue;
+      if (!el.matches(semanticAssistant) && el.parentElement.closest(semanticAssistant)) continue;
+      const fallback = !el.matches(semanticAssistant) && !el.matches(renderedAssistant);
+      if (fallback && (el.closest(promptSelector) || el.parentElement.closest(renderedAssistant))) continue;
+      const turn = fallback && el.closest('[data-turn-key]');
       const id = el.closest('[data-message-id]')?.dataset.messageId ||
-        el.closest('[data-chatgpt-search-message-ids]')?.getAttribute('data-chatgpt-search-message-ids');
+        el.closest('[data-chatgpt-search-message-ids]')?.getAttribute('data-chatgpt-search-message-ids') ||
+        (turn ? 'turn-'+turn.dataset.turnKey : undefined);
       const nodes = [...el.querySelectorAll('h1,h2')].filter(h =>
         !h.closest('pre,code,nav,aside,button,[aria-hidden="true"]') && h.textContent.trim());
-      found.push({el,id,owner,nodes,ordinal:ordinal++});
+      const previous = found.at(-1);
+      if (fallback && previous?.id === id && previous.owner === owner) previous.nodes.push(...nodes);
+      else found.push({el,id,owner,nodes,ordinal:ordinal++});
     }
     return found;
   }
